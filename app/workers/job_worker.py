@@ -1,10 +1,12 @@
+# app/workers/job_worker.py
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
-
 import aio_pika
 
+from app.services.job_service import JobService
 from app.core.config import get_settings
 from app.infrastructure.database import async_session_factory
 from app.infrastructure.rabbitmq import JOBS_QUEUE_NAME
@@ -17,6 +19,22 @@ logger = logging.getLogger("job_worker")
 
 settings = get_settings()
 
+CANCEL_POLL_INTERVAL_SECONDS = 2.0
+
+
+async def _watch_for_cancellation(job_id: uuid.UUID, cancel_event: asyncio.Event) -> None:
+    """Runs alongside the handler; polls the DB on its own session so it
+    always sees committed writes from the cancel endpoint (not a stale
+    snapshot from a long-lived transaction)."""
+    while True:
+        await asyncio.sleep(CANCEL_POLL_INTERVAL_SECONDS)
+        async with async_session_factory() as session:
+            repository = SQLAlchemyJobRepository(session)
+            job = await repository.get_by_id(job_id)
+            if job is not None and job.status == JobStatus.CANCELLED:
+                cancel_event.set()
+                return
+
 
 async def process_message(message: aio_pika.abc.AbstractIncomingMessage) -> None:
     async with message.process():
@@ -25,34 +43,76 @@ async def process_message(message: aio_pika.abc.AbstractIncomingMessage) -> None
 
         async with async_session_factory() as session:
             repository = SQLAlchemyJobRepository(session)
+            job_service = JobService(repository)
             job = await repository.get_by_id(job_id)
 
             if job is None:
                 logger.warning("Job %s not found, skipping", job_id)
                 return
 
-            if job.status == JobStatus.CANCELLED:
-                logger.info("Job %s already cancelled, skipping execution", job_id)
+            claimed = await repository.transition_status(
+                job_id,
+                expected_statuses=(JobStatus.PENDING,),
+                new_status=JobStatus.RUNNING,
+            )
+            if not claimed:
+                logger.info(
+                    "Job %s could not be claimed (status=%s), skipping",
+                    job_id, job.status.value,
+                )
                 return
 
-            await repository.update_status(job.id, JobStatus.RUNNING)
             await repository.add_log(job.id, f"Started executing task '{job.task_type}'")
 
+            async def log_fn(msg: str) -> None:
+                await repository.add_log(job.id, msg)
+
+            cancel_event = asyncio.Event()
+            watcher = asyncio.create_task(_watch_for_cancellation(job_id, cancel_event))
+            handler = get_task_handler(job.task_type)
+            handler_task = asyncio.create_task(handler(job.payload, log_fn))
+
             try:
-                handler = get_task_handler(job.task_type)
+                waiter = asyncio.create_task(cancel_event.wait())
+                done, _pending = await asyncio.wait(
+                    {handler_task, waiter}, return_when=asyncio.FIRST_COMPLETED
+                )
 
-                async def log_fn(msg: str) -> None:
-                    await repository.add_log(job.id, msg)
+                if cancel_event.is_set():
+                    handler_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await handler_task
+                    logger.info("Job %s cancelled during execution", job_id)
+                    await repository.add_log(job.id, "Job cancelled during execution", level="warning")
+                    await job_service.promote_next_queued_job(job.created_by_id)
+                    return
 
-                result = await handler(job.payload, log_fn)
+                waiter.cancel()
+                result = handler_task.result()
 
-                await repository.update_status(job.id, JobStatus.COMPLETED, result=result)
+                await repository.transition_status(
+                    job_id,
+                    expected_statuses=(JobStatus.RUNNING,),
+                    new_status=JobStatus.COMPLETED,
+                    result=result,
+                )
                 await repository.add_log(job.id, "Job completed successfully")
+                await job_service.promote_next_queued_job(job.created_by_id)
 
             except Exception as exc:
                 logger.exception("Job %s failed", job_id)
-                await repository.update_status(job.id, JobStatus.FAILED, error_message=str(exc))
+                await repository.transition_status(
+                    job_id,
+                    expected_statuses=(JobStatus.RUNNING,),
+                    new_status=JobStatus.FAILED,
+                    error_message=str(exc),
+                )
                 await repository.add_log(job.id, f"Job failed: {exc}", level="error")
+                await job_service.promote_next_queued_job(job.created_by_id)
+            finally:
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watcher
 
 
 async def main() -> None:

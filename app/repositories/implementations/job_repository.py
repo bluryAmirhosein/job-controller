@@ -1,7 +1,8 @@
+# app/repositories/implementations/job_repository.py
 import uuid
-
-from sqlalchemy import select
+from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
+import contextlib
 
 from app.models.job import Job, JobStatus
 from app.models.job_log import JobLog
@@ -42,22 +43,30 @@ class SQLAlchemyJobRepository(IJobRepository):
         result = await self._session.execute(query)
         return list(result.scalars().all())
 
-    async def update_status(
+    async def transition_status(
         self,
         job_id: uuid.UUID,
-        status: JobStatus,
+        *,
+        expected_statuses: tuple[JobStatus, ...],
+        new_status: JobStatus,
         result: dict | None = None,
         error_message: str | None = None,
-    ) -> None:
-        job = await self.get_by_id(job_id)
-        if job is None:
-            return
-        job.status = status
+    ) -> bool:
+        values: dict = {"status": new_status}
         if result is not None:
-            job.result = result
+            values["result"] = result
         if error_message is not None:
-            job.error_message = error_message
+            values["error_message"] = error_message
+
+        stmt = (
+            update(Job)
+            .where(Job.id == job_id, Job.status.in_(expected_statuses))
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        exec_result = await self._session.execute(stmt)
         await self._session.commit()
+        return exec_result.rowcount > 0
 
     async def add_log(self, job_id: uuid.UUID, message: str, level: str = "info") -> JobLog:
         log_entry = JobLog(job_id=job_id, message=message, level=level)
@@ -71,3 +80,38 @@ class SQLAlchemyJobRepository(IJobRepository):
             select(JobLog).where(JobLog.job_id == job_id).order_by(JobLog.created_at.asc())
         )
         return list(result.scalars().all())
+
+    async def count_by_statuses_for_owner(
+        self, owner_id: uuid.UUID, statuses: tuple[JobStatus, ...]
+    ) -> int:
+        result = await self._session.execute(
+            select(func.count()).select_from(Job).where(
+                Job.created_by_id == owner_id,
+                Job.status.in_(statuses),
+            )
+        )
+        return result.scalar_one()
+
+    async def get_oldest_by_status_for_owner(
+        self, owner_id: uuid.UUID, status: JobStatus
+    ) -> Job | None:
+        result = await self._session.execute(
+            select(Job)
+            .where(Job.created_by_id == owner_id, Job.status == status)
+            .order_by(Job.created_at.asc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    def owner_lock(self, owner_id: uuid.UUID):
+        return self._owner_lock(owner_id)
+
+    @contextlib.asynccontextmanager
+    async def _owner_lock(self, owner_id: uuid.UUID):
+        key_result = await self._session.execute(select(func.hashtext(str(owner_id))))
+        lock_key = key_result.scalar_one()
+        await self._session.execute(select(func.pg_advisory_lock(lock_key)))
+        try:
+            yield
+        finally:
+            await self._session.execute(select(func.pg_advisory_unlock(lock_key)))

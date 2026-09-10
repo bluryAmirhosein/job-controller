@@ -22,7 +22,6 @@ def get_task_handler(task_type: str) -> TaskHandler:
     return handler
 
 
-# --- نمونه Task — این الگو رو برای Task های واقعی بعدی تکرار کن ---
 @task("demo_sleep")
 async def demo_sleep_task(payload: dict, log: LogFn) -> dict:
     seconds = int(payload.get("seconds", 5))

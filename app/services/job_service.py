@@ -8,6 +8,8 @@ from app.repositories.interfaces.job_repository import IJobRepository
 from app.schemas.job import JobCreateRequest
 
 
+MAX_CONCURRENT_RUNNING_JOBS = 3
+
 class JobService:
     def __init__(self, job_repository: IJobRepository):
         self._job_repository = job_repository
@@ -18,7 +20,6 @@ class JobService:
         current_user: User,
         idempotency_key: str | None,
     ) -> tuple[Job, bool]:
-        """خروجی: (job, created). created=False یعنی job قبلی (idempotent replay) برگردونده شده."""
         if idempotency_key:
             existing_job = await self._job_repository.get_by_idempotency_key(
                 current_user.id, idempotency_key
@@ -33,22 +34,80 @@ class JobService:
             created_by_id=current_user.id,
             idempotency_key=idempotency_key,
         )
-        job = await self._job_repository.create(job)
 
-        try:
-            await publish_job_message(str(job.id))
-        except Exception as exc:
-            await self._job_repository.update_status(
-                job.id,
-                JobStatus.FAILED,
-                error_message=f"Failed to publish job to queue: {exc}",
+        async with self._job_repository.owner_lock(current_user.id):
+            job = await self._job_repository.create(job)
+
+            active_count = await self._job_repository.count_by_statuses_for_owner(
+                current_user.id, (JobStatus.PENDING, JobStatus.RUNNING)
             )
-            raise RuntimeError("Failed to enqueue job") from exc
+            # active_count خودِ همین job تازه‌ساخته‌شده رو هم شامل می‌شه
+            can_dispatch_now = active_count <= MAX_CONCURRENT_RUNNING_JOBS
 
-        await self._job_repository.update_status(job.id, JobStatus.QUEUED)
-        job.status = JobStatus.QUEUED
+            if can_dispatch_now:
+                try:
+                    await publish_job_message(str(job.id))
+                except Exception as exc:
+                    await self._job_repository.transition_status(
+                        job.id,
+                        expected_statuses=(JobStatus.PENDING,),
+                        new_status=JobStatus.FAILED,
+                        error_message=f"Failed to publish job to queue: {exc}",
+                    )
+                    raise RuntimeError("Failed to enqueue job") from exc
+                # وضعیت PENDING می‌مونه؛ ورکر با claim کردن می‌برتش RUNNING
+            else:
+                await self._job_repository.transition_status(
+                    job.id,
+                    expected_statuses=(JobStatus.PENDING,),
+                    new_status=JobStatus.QUEUED,
+                )
+                job.status = JobStatus.QUEUED
 
         return job, True
+
+    async def promote_next_queued_job(self, owner_id: uuid.UUID | None) -> None:
+
+        if owner_id is None:
+            return
+
+        next_job = await self._job_repository.get_oldest_by_status_for_owner(
+            owner_id, JobStatus.QUEUED
+        )
+        if next_job is None:
+            return
+
+        # 1) اول توی دیتابیس وضعیت رو PENDING کن و commit کن
+        transitioned = await self._job_repository.transition_status(
+            next_job.id,
+            expected_statuses=(JobStatus.QUEUED,),
+            new_status=JobStatus.PENDING,
+        )
+        if not transitioned:
+            # یکی دیگه (مثلاً cancel هم‌زمان) وضعیتش رو عوض کرده؛ کاری نکن
+            return
+
+        # 2) فقط بعد از commit شدن transition، پیام رو پابلیش کن
+        try:
+            await publish_job_message(str(next_job.id))
+        except Exception as exc:
+            # publish شکست خورد ولی الان job توی دیتابیس PENDING مونده در
+            # حالی که هیچ پیامی توی صف نیست -> برش‌گردون به QUEUED تا دفعه‌ی
+            # بعد که یه اسلات آزاد بشه، دوباره promote_next_queued_job
+            # تلاش کنه این job رو دیسپچ کنه.
+            await self._job_repository.transition_status(
+                next_job.id,
+                expected_statuses=(JobStatus.PENDING,),
+                new_status=JobStatus.QUEUED,
+            )
+            await self._job_repository.add_log(
+                next_job.id, f"Failed to dispatch queued job: {exc}", level="error"
+            )
+            return
+
+        await self._job_repository.add_log(
+            next_job.id, "Dispatched after a running slot freed up"
+        )
 
     async def get_job(self, job_id: uuid.UUID, current_user: User) -> Job | None:
         job = await self._job_repository.get_by_id(job_id)
@@ -72,9 +131,23 @@ class JobService:
         if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
             raise ValueError(f"Cannot cancel a job with status '{job.status.value}'")
 
-        await self._job_repository.update_status(job.id, JobStatus.CANCELLED)
+        was_running = job.status == JobStatus.RUNNING
+
+        transitioned = await self._job_repository.transition_status(
+            job.id,
+            expected_statuses=(JobStatus.PENDING, JobStatus.QUEUED, JobStatus.RUNNING),
+            new_status=JobStatus.CANCELLED,
+        )
+        if not transitioned:
+            job = await self.get_job(job_id, current_user)
+            raise ValueError(f"Cannot cancel a job with status '{job.status.value}'")
+
         job.status = JobStatus.CANCELLED
         await self._job_repository.add_log(job.id, "Job cancelled by user request")
+
+        if was_running:
+            await self.promote_next_queued_job(job.created_by_id)
+
         return job
 
     async def get_logs(self, job_id: uuid.UUID, current_user: User) -> list[JobLog] | None:
