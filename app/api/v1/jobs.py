@@ -6,11 +6,19 @@ from app.core.dependencies import get_current_user, get_job_service
 from app.models.user import User
 from app.schemas.job import JobCreateRequest, JobLogResponse, JobResponse
 from app.services.job_service import JobService
-
+from app.core.rate_limiter import rate_limit
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
+create_job_rate_limit = rate_limit(
+    max_requests=10, window_seconds=60, key_prefix="rate_limit:jobs:create"
+)
 
-@router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=JobResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(create_job_rate_limit)],
+)
 async def create_job(
     payload: JobCreateRequest,
     response: Response,
@@ -25,7 +33,6 @@ async def create_job(
 
     response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
     return JobResponse.model_validate(job)
-
 
 @router.get("", response_model=list[JobResponse])
 async def list_jobs(
