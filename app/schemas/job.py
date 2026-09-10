@@ -19,6 +19,7 @@ class JobResponse(BaseModel):
     payload: dict[str, Any]
     result: dict[str, Any] | None
     error_message: str | None
+    retry_count: int
     created_at: datetime
     updated_at: datetime
 

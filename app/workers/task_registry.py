@@ -7,6 +7,12 @@ TaskHandler = Callable[[dict, LogFn], Awaitable[dict]]
 _TASK_REGISTRY: dict[str, TaskHandler] = {}
 
 
+class TaskValidationError(Exception):
+    """Handler ها این رو raise می‌کنن وقتی payload ناقص/نامعتبره.
+    این خطا نباید retry بشه؛ Job باید فوراً FAILED بشه."""
+    pass
+
+
 def task(name: str):
     def decorator(func: TaskHandler) -> TaskHandler:
         _TASK_REGISTRY[name] = func
@@ -24,7 +30,10 @@ def get_task_handler(task_type: str) -> TaskHandler:
 
 @task("demo_sleep")
 async def demo_sleep_task(payload: dict, log: LogFn) -> dict:
-    seconds = int(payload.get("seconds", 5))
+    if "seconds" not in payload:
+        raise TaskValidationError("Missing required field 'seconds' in payload")
+
+    seconds = int(payload["seconds"])
     await log(f"Sleeping for {seconds} seconds")
     for i in range(seconds):
         await asyncio.sleep(1)

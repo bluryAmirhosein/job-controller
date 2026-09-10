@@ -41,7 +41,7 @@ class JobService:
             active_count = await self._job_repository.count_by_statuses_for_owner(
                 current_user.id, (JobStatus.PENDING, JobStatus.RUNNING)
             )
-            # active_count خودِ همین job تازه‌ساخته‌شده رو هم شامل می‌شه
+
             can_dispatch_now = active_count <= MAX_CONCURRENT_RUNNING_JOBS
 
             if can_dispatch_now:

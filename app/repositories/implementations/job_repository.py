@@ -51,12 +51,15 @@ class SQLAlchemyJobRepository(IJobRepository):
         new_status: JobStatus,
         result: dict | None = None,
         error_message: str | None = None,
+        retry_count: int | None = None,
     ) -> bool:
         values: dict = {"status": new_status}
         if result is not None:
             values["result"] = result
         if error_message is not None:
             values["error_message"] = error_message
+        if retry_count is not None:
+            values["retry_count"] = retry_count
 
         stmt = (
             update(Job)

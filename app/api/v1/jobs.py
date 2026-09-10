@@ -23,7 +23,6 @@ async def create_job(
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
-    # اگه idempotency key تکراری بود، همون job قبلی با 200 برگردونده میشه، نه 201
     response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
     return JobResponse.model_validate(job)
 

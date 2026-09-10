@@ -32,12 +32,17 @@ class IJobRepository(ABC):
         new_status: JobStatus,
         result: dict | None = None,
         error_message: str | None = None,
+        retry_count: int | None = None,
     ) -> bool:
         """Atomically move the job to new_status only if its current status is
         one of expected_statuses. Returns True if the transition happened,
         False if the job was already in some other state (e.g. cancelled
         concurrently) — in which case the caller must NOT proceed as if the
-        transition succeeded."""
+        transition succeeded.
+
+        retry_count, when provided, is persisted alongside the status change
+        (used by the worker to record how many retry attempts a job has gone
+        through, including interim updates while it's still RUNNING)."""
         ...
 
     @abstractmethod
