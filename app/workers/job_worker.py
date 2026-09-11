@@ -1,10 +1,12 @@
 # app/workers/job_worker.py
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import uuid
 import aio_pika
+from redis.asyncio import Redis
 
 from app.services.job_service import JobService
 from app.core.config import get_settings
@@ -21,27 +23,31 @@ settings = get_settings()
 
 CANCEL_POLL_INTERVAL_SECONDS = 2.0
 MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 2.0  # backoff خطی: attempt * RETRY_BACKOFF_SECONDS
+RETRY_BACKOFF_SECONDS = 2.0
 
 
-async def _watch_for_cancellation(job_id: uuid.UUID, cancel_event: asyncio.Event) -> None:
+async def _watch_for_cancellation(
+    job_id: uuid.UUID, cancel_event: asyncio.Event, redis: Redis
+) -> None:
     while True:
         await asyncio.sleep(CANCEL_POLL_INTERVAL_SECONDS)
         async with async_session_factory() as session:
-            repository = SQLAlchemyJobRepository(session)
+            repository = SQLAlchemyJobRepository(session, redis)
             job = await repository.get_by_id(job_id)
             if job is not None and job.status == JobStatus.CANCELLED:
                 cancel_event.set()
                 return
 
 
-async def process_message(message: aio_pika.abc.AbstractIncomingMessage) -> None:
+async def process_message(
+    message: aio_pika.abc.AbstractIncomingMessage, redis: Redis
+) -> None:
     async with message.process():
         body = json.loads(message.body.decode())
         job_id = uuid.UUID(body["job_id"])
 
         async with async_session_factory() as session:
-            repository = SQLAlchemyJobRepository(session)
+            repository = SQLAlchemyJobRepository(session, redis)
             job_service = JobService(repository)
             job = await repository.get_by_id(job_id)
 
@@ -67,7 +73,9 @@ async def process_message(message: aio_pika.abc.AbstractIncomingMessage) -> None
                 await repository.add_log(job.id, msg)
 
             cancel_event = asyncio.Event()
-            watcher = asyncio.create_task(_watch_for_cancellation(job_id, cancel_event))
+            watcher = asyncio.create_task(
+                _watch_for_cancellation(job_id, cancel_event, redis)
+            )
 
             async def _handle_cancelled(attempt: int, handler_task: asyncio.Task | None = None) -> None:
                 if handler_task is not None:
@@ -140,8 +148,6 @@ async def process_message(message: aio_pika.abc.AbstractIncomingMessage) -> None
                             await _fail(str(exc), attempt=attempt)
                             return
 
-                        # مقدار retry_count رو همین الان persist می‌کنیم (status هنوز RUNNING می‌مونه)
-                        # تا وضعیت واقعی retry هر Job از بیرون هم قابل مشاهده باشه، نه فقط توی لاگ.
                         await repository.transition_status(
                             job_id,
                             expected_statuses=(JobStatus.RUNNING,),
@@ -186,6 +192,8 @@ async def process_message(message: aio_pika.abc.AbstractIncomingMessage) -> None
 
 
 async def main() -> None:
+    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+
     connection = await aio_pika.connect_robust(settings.rabbitmq_url)
     async with connection:
         channel = await connection.channel()
@@ -193,9 +201,12 @@ async def main() -> None:
         queue = await channel.declare_queue(JOBS_QUEUE_NAME, durable=True)
 
         logger.info("Worker started, waiting for jobs on '%s'", JOBS_QUEUE_NAME)
-        await queue.consume(process_message)
+        await queue.consume(functools.partial(process_message, redis=redis))
 
-        await asyncio.Future()
+        try:
+            await asyncio.Future()
+        finally:
+            await redis.aclose()
 
 
 if __name__ == "__main__":
