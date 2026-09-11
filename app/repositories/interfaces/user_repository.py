@@ -1,7 +1,7 @@
 import uuid
 from abc import ABC, abstractmethod
 
-from app.models.user import User
+from app.models.user import User, UserRole
 
 
 class IUserRepository(ABC):
@@ -13,3 +13,6 @@ class IUserRepository(ABC):
 
     @abstractmethod
     async def create(self, user: User) -> User: ...
+
+    @abstractmethod
+    async def update_role(self, user_id: uuid.UUID, role: UserRole) -> User | None: ...
