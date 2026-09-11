@@ -72,6 +72,7 @@ class IJobRepository(ABC):
 
     @abstractmethod
     def owner_lock(self, owner_id: uuid.UUID):
-        """Async context manager: یه Postgres advisory lock مختص این owner
-        می‌گیره تا درخواست‌های هم‌زمانِ create_job برای یک کاربر سریالایز بشن."""
+        """Async context manager: acquires a PostgreSQL advisory lock
+         scoped to the specified owner to serialize concurrent create_job
+          requests for the same user."""
         ...

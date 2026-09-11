@@ -8,6 +8,7 @@ from sqlalchemy import select, update, func, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.cache.job_list_cache import ADMIN_SCOPE, bump_job_list_version
+from app.infrastructure.realtime.job_events import publish_job_event
 from app.models.job import Job, JobStatus
 from app.models.job_log import JobLog
 from app.repositories.interfaces.job_repository import IJobRepository
@@ -25,6 +26,16 @@ class SQLAlchemyJobRepository(IJobRepository):
 
         await bump_job_list_version(self._redis, str(job.created_by_id))
         await bump_job_list_version(self._redis, ADMIN_SCOPE)
+
+        await publish_job_event(
+            self._redis,
+            event="job.created",
+            job_id=job.id,
+            created_by_id=job.created_by_id,
+            status=job.status,
+            error_message=job.error_message,
+            retry_count=job.retry_count,
+        )
 
         return job
 
@@ -95,7 +106,7 @@ class SQLAlchemyJobRepository(IJobRepository):
             .where(Job.id == job_id, Job.status.in_(expected_statuses))
             .values(**values)
             .execution_options(synchronize_session=False)
-            .returning(Job.created_by_id)
+            .returning(Job.created_by_id, Job.status, Job.error_message, Job.retry_count)
         )
         exec_result = await self._session.execute(stmt)
         owner_row = exec_result.first()
@@ -106,6 +117,20 @@ class SQLAlchemyJobRepository(IJobRepository):
 
         await bump_job_list_version(self._redis, str(owner_row.created_by_id))
         await bump_job_list_version(self._redis, ADMIN_SCOPE)
+
+        # We use owner_row instead of the local `values` dict, because owner_row
+        # reflects the actual full row state after the UPDATE (e.g. when
+        # retry_count wasn't passed but its current DB value still matters).
+        await publish_job_event(
+            self._redis,
+            event="job.status_changed",
+            job_id=job_id,
+            created_by_id=owner_row.created_by_id,
+            status=owner_row.status,
+            error_message=owner_row.error_message,
+            retry_count=owner_row.retry_count,
+        )
+
         return True
 
     async def add_log(self, job_id: uuid.UUID, message: str, level: str = "info") -> JobLog:

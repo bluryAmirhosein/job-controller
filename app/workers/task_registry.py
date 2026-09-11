@@ -8,8 +8,8 @@ _TASK_REGISTRY: dict[str, TaskHandler] = {}
 
 
 class TaskValidationError(Exception):
-    """Handler ها این رو raise می‌کنن وقتی payload ناقص/نامعتبره.
-    این خطا نباید retry بشه؛ Job باید فوراً FAILED بشه."""
+    """Raised by handlers when the payload is missing or invalid.
+     This error must not be retried; the Job should immediately transition to FAILED."""
     pass
 
 

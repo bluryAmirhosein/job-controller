@@ -1,3 +1,4 @@
+import contextlib
 from collections.abc import AsyncGenerator
 
 from sqlalchemy import text
@@ -21,6 +22,17 @@ class Base(DeclarativeBase):
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency, used via Depends() in regular HTTP routes."""
+    async with async_session_factory() as session:
+        yield session
+
+
+@contextlib.asynccontextmanager
+async def get_session_context() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Standalone context manager for places that can't use Depends() —
+    WebSocket auth, background tasks, Celery workers, etc.
+    """
     async with async_session_factory() as session:
         yield session
 
@@ -32,5 +44,6 @@ async def check_database_health() -> bool:
         return True
     except Exception:
         return False
+
 
 from app import models
