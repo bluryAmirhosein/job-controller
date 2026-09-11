@@ -3,10 +3,12 @@ from collections.abc import Callable
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decode_access_token
 from app.infrastructure.database import get_db_session
+from app.infrastructure.redis_client import get_redis_client
 from app.models.user import User, UserRole
 from app.repositories.implementations.job_repository import SQLAlchemyJobRepository
 from app.repositories.implementations.user_repository import SQLAlchemyUserRepository
@@ -26,8 +28,11 @@ def get_auth_service(user_repository: IUserRepository = Depends(get_user_reposit
     return AuthService(user_repository)
 
 
-def get_job_repository(session: AsyncSession = Depends(get_db_session)) -> IJobRepository:
-    return SQLAlchemyJobRepository(session)
+def get_job_repository(
+    session: AsyncSession = Depends(get_db_session),
+    redis: Redis = Depends(get_redis_client),
+) -> IJobRepository:
+    return SQLAlchemyJobRepository(session, redis)
 
 
 def get_job_service(job_repository: IJobRepository = Depends(get_job_repository)) -> JobService:

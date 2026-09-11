@@ -1,22 +1,32 @@
 # app/repositories/implementations/job_repository.py
 import uuid
-from sqlalchemy import select, update, func
-from sqlalchemy.ext.asyncio import AsyncSession
 import contextlib
 
+from redis.asyncio import Redis
+from sqlalchemy import select, update, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.infrastructure.cache.job_list_cache import ADMIN_SCOPE, bump_job_list_version
 from app.models.job import Job, JobStatus
 from app.models.job_log import JobLog
 from app.repositories.interfaces.job_repository import IJobRepository
 
 
 class SQLAlchemyJobRepository(IJobRepository):
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession, redis: Redis):
         self._session = session
+        self._redis = redis
 
     async def create(self, job: Job) -> Job:
         self._session.add(job)
         await self._session.commit()
         await self._session.refresh(job)
+
+        # A new job changes both the owner's list and the admin's
+        # unfiltered list, so invalidate both scopes.
+        await bump_job_list_version(self._redis, str(job.created_by_id))
+        await bump_job_list_version(self._redis, ADMIN_SCOPE)
+
         return job
 
     async def get_by_id(self, job_id: uuid.UUID) -> Job | None:
@@ -66,10 +76,21 @@ class SQLAlchemyJobRepository(IJobRepository):
             .where(Job.id == job_id, Job.status.in_(expected_statuses))
             .values(**values)
             .execution_options(synchronize_session=False)
+            # RETURNING lets us learn the job's owner in the same
+            # round trip, so we can invalidate its cache scope without
+            # an extra SELECT.
+            .returning(Job.created_by_id)
         )
         exec_result = await self._session.execute(stmt)
+        owner_row = exec_result.first()
         await self._session.commit()
-        return exec_result.rowcount > 0
+
+        if owner_row is None:
+            return False
+
+        await bump_job_list_version(self._redis, str(owner_row.created_by_id))
+        await bump_job_list_version(self._redis, ADMIN_SCOPE)
+        return True
 
     async def add_log(self, job_id: uuid.UUID, message: str, level: str = "info") -> JobLog:
         log_entry = JobLog(job_id=job_id, message=message, level=level)

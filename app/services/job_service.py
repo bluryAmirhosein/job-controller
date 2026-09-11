@@ -55,7 +55,8 @@ class JobService:
                         error_message=f"Failed to publish job to queue: {exc}",
                     )
                     raise RuntimeError("Failed to enqueue job") from exc
-                # وضعیت PENDING می‌مونه؛ ورکر با claim کردن می‌برتش RUNNING
+                # Status stays PENDING; the worker moves it to RUNNING
+                # once it claims the job.
             else:
                 await self._job_repository.transition_status(
                     job.id,
@@ -77,24 +78,25 @@ class JobService:
         if next_job is None:
             return
 
-        # 1) اول توی دیتابیس وضعیت رو PENDING کن و commit کن
+        # 1) First transition the status to PENDING in the database and commit.
         transitioned = await self._job_repository.transition_status(
             next_job.id,
             expected_statuses=(JobStatus.QUEUED,),
             new_status=JobStatus.PENDING,
         )
         if not transitioned:
-            # یکی دیگه (مثلاً cancel هم‌زمان) وضعیتش رو عوض کرده؛ کاری نکن
+            # Someone else (e.g. a concurrent cancel) already changed its
+            # status; do nothing.
             return
 
-        # 2) فقط بعد از commit شدن transition، پیام رو پابلیش کن
+        # 2) Only publish the message after the transition has been committed.
         try:
             await publish_job_message(str(next_job.id))
         except Exception as exc:
-            # publish شکست خورد ولی الان job توی دیتابیس PENDING مونده در
-            # حالی که هیچ پیامی توی صف نیست -> برش‌گردون به QUEUED تا دفعه‌ی
-            # بعد که یه اسلات آزاد بشه، دوباره promote_next_queued_job
-            # تلاش کنه این job رو دیسپچ کنه.
+            # Publish failed, but the job is now PENDING in the database
+            # while no message was actually queued -> revert it back to
+            # QUEUED so that the next time a slot frees up,
+            # promote_next_queued_job will retry dispatching this job.
             await self._job_repository.transition_status(
                 next_job.id,
                 expected_statuses=(JobStatus.PENDING,),
