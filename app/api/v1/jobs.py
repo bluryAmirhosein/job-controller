@@ -12,7 +12,7 @@ from app.infrastructure.cache.job_list_cache import (
 from app.infrastructure.redis_client import get_redis_client
 from app.core.dependencies import get_current_user, get_job_service
 from app.models.user import User
-from app.schemas.job import JobCreateRequest, JobLogResponse, JobResponse
+from app.schemas.job import JobCreateRequest, JobListResponse, JobLogResponse, JobResponse
 from app.services.job_service import JobService
 from app.core.rate_limiter import rate_limit
 from app.models.user import UserRole
@@ -46,30 +46,36 @@ async def create_job(
     return JobResponse.model_validate(job)
 
 
-@router.get("", response_model=list[JobResponse])
+@router.get("", response_model=JobListResponse)
 async def list_jobs(
         limit: int = Query(default=50, ge=1, le=200),
-        offset: int = Query(default=0, ge=0),
+        cursor: str | None = Query(default=None),
         current_user: User = Depends(get_current_user),
         job_service: JobService = Depends(get_job_service),
         redis: Redis = Depends(get_redis_client),
-) -> list[JobResponse]:
+) -> JobListResponse:
     scope = ADMIN_SCOPE if current_user.role == UserRole.ADMIN else str(current_user.id)
     version = await get_job_list_version(redis, scope)
+    cache_cursor_key = cursor or "first-page"
 
-    cached = await get_cached_job_list(redis, scope, version, limit, offset)
+    cached = await get_cached_job_list(redis, scope, version, limit, cache_cursor_key)
     if cached is not None:
-        # Already shaped like JobResponse; FastAPI validates/serializes
-        # it against response_model on the way out.
-        return json.loads(cached)
+        return JobListResponse.model_validate(json.loads(cached))
 
-    jobs = await job_service.list_jobs(current_user, limit=limit, offset=offset)
-    responses = [JobResponse.model_validate(job) for job in jobs]
+    try:
+        jobs, next_cursor = await job_service.list_jobs(current_user, limit=limit, cursor=cursor)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    payload = json.dumps([r.model_dump(mode="json") for r in responses])
-    await set_cached_job_list(redis, scope, version, limit, offset, payload)
+    response_data = JobListResponse(
+        items=[JobResponse.model_validate(job) for job in jobs],
+        next_cursor=next_cursor,
+    )
 
-    return responses
+    payload = json.dumps(response_data.model_dump(mode="json"))
+    await set_cached_job_list(redis, scope, version, limit, cache_cursor_key, payload)
+
+    return response_data
 
 
 @router.get("/{job_id}", response_model=JobResponse)

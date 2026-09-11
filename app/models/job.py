@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -24,6 +24,13 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         UniqueConstraint("created_by_id", "idempotency_key", name="uq_job_owner_idempotency_key"),
+        Index(
+            "ix_jobs_created_by_created_at_id",
+            "created_by_id",
+            "created_at",
+            "id",
+            postgresql_ops={"created_at": "DESC", "id": "DESC"},
+        ),
     )
     __mapper_args__ = {"eager_defaults": True}
 

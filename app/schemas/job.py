@@ -26,6 +26,11 @@ class JobResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class JobListResponse(BaseModel):
+    items: list[JobResponse]
+    next_cursor: str | None = None
+
+
 class JobLogResponse(BaseModel):
     id: uuid.UUID
     level: str

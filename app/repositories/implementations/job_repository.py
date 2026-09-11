@@ -1,9 +1,10 @@
 # app/repositories/implementations/job_repository.py
 import uuid
 import contextlib
+from datetime import datetime
 
 from redis.asyncio import Redis
-from sqlalchemy import select, update, func
+from sqlalchemy import select, update, func, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.cache.job_list_cache import ADMIN_SCOPE, bump_job_list_version
@@ -22,8 +23,6 @@ class SQLAlchemyJobRepository(IJobRepository):
         await self._session.commit()
         await self._session.refresh(job)
 
-        # A new job changes both the owner's list and the admin's
-        # unfiltered list, so invalidate both scopes.
         await bump_job_list_version(self._redis, str(job.created_by_id))
         await bump_job_list_version(self._redis, ADMIN_SCOPE)
 
@@ -45,11 +44,31 @@ class SQLAlchemyJobRepository(IJobRepository):
         return result.scalar_one_or_none()
 
     async def list_jobs(
-        self, owner_id: uuid.UUID | None, limit: int, offset: int
+        self,
+        owner_id: uuid.UUID | None,
+        limit: int,
+        cursor: tuple[datetime, uuid.UUID] | None = None,
     ) -> list[Job]:
-        query = select(Job).order_by(Job.created_at.desc()).limit(limit).offset(offset)
+        query = (
+            select(Job)
+            .order_by(Job.created_at.desc(), Job.id.desc())
+            .limit(limit + 1)
+        )
         if owner_id is not None:
             query = query.where(Job.created_by_id == owner_id)
+
+        if cursor is not None:
+            cursor_created_at, cursor_id = cursor
+            query = query.where(
+                or_(
+                    Job.created_at < cursor_created_at,
+                    and_(
+                        Job.created_at == cursor_created_at,
+                        Job.id < cursor_id,
+                    ),
+                )
+            )
+
         result = await self._session.execute(query)
         return list(result.scalars().all())
 
@@ -76,9 +95,6 @@ class SQLAlchemyJobRepository(IJobRepository):
             .where(Job.id == job_id, Job.status.in_(expected_statuses))
             .values(**values)
             .execution_options(synchronize_session=False)
-            # RETURNING lets us learn the job's owner in the same
-            # round trip, so we can invalidate its cache scope without
-            # an extra SELECT.
             .returning(Job.created_by_id)
         )
         exec_result = await self._session.execute(stmt)

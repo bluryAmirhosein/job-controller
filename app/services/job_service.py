@@ -1,5 +1,6 @@
 import uuid
 
+from app.core.pagination import decode_cursor, encode_cursor
 from app.infrastructure.rabbitmq import publish_job_message
 from app.models.job import Job, JobStatus
 from app.models.job_log import JobLog
@@ -55,8 +56,6 @@ class JobService:
                         error_message=f"Failed to publish job to queue: {exc}",
                     )
                     raise RuntimeError("Failed to enqueue job") from exc
-                # Status stays PENDING; the worker moves it to RUNNING
-                # once it claims the job.
             else:
                 await self._job_repository.transition_status(
                     job.id,
@@ -68,7 +67,6 @@ class JobService:
         return job, True
 
     async def promote_next_queued_job(self, owner_id: uuid.UUID | None) -> None:
-
         if owner_id is None:
             return
 
@@ -78,25 +76,17 @@ class JobService:
         if next_job is None:
             return
 
-        # 1) First transition the status to PENDING in the database and commit.
         transitioned = await self._job_repository.transition_status(
             next_job.id,
             expected_statuses=(JobStatus.QUEUED,),
             new_status=JobStatus.PENDING,
         )
         if not transitioned:
-            # Someone else (e.g. a concurrent cancel) already changed its
-            # status; do nothing.
             return
 
-        # 2) Only publish the message after the transition has been committed.
         try:
             await publish_job_message(str(next_job.id))
         except Exception as exc:
-            # Publish failed, but the job is now PENDING in the database
-            # while no message was actually queued -> revert it back to
-            # QUEUED so that the next time a slot frees up,
-            # promote_next_queued_job will retry dispatching this job.
             await self._job_repository.transition_status(
                 next_job.id,
                 expected_statuses=(JobStatus.PENDING,),
@@ -120,10 +110,21 @@ class JobService:
         return job
 
     async def list_jobs(
-        self, current_user: User, limit: int = 50, offset: int = 0
-    ) -> list[Job]:
+        self, current_user: User, limit: int = 50, cursor: str | None = None
+    ) -> tuple[list[Job], str | None]:
         owner_id = None if current_user.role == UserRole.ADMIN else current_user.id
-        return await self._job_repository.list_jobs(owner_id=owner_id, limit=limit, offset=offset)
+
+        decoded_cursor = decode_cursor(cursor) if cursor is not None else None
+
+        jobs = await self._job_repository.list_jobs(
+            owner_id=owner_id, limit=limit, cursor=decoded_cursor
+        )
+
+        has_more = len(jobs) > limit
+        page = jobs[:limit]
+        next_cursor = encode_cursor(page[-1]) if has_more and page else None
+
+        return page, next_cursor
 
     async def cancel_job(self, job_id: uuid.UUID, current_user: User) -> Job | None:
         job = await self.get_job(job_id, current_user)

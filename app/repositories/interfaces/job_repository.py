@@ -1,6 +1,7 @@
 # app/repositories/interfaces/job_repository.py
 import uuid
 from abc import ABC, abstractmethod
+from datetime import datetime
 
 from app.models.job import Job, JobStatus
 from app.models.job_log import JobLog
@@ -20,8 +21,16 @@ class IJobRepository(ABC):
 
     @abstractmethod
     async def list_jobs(
-        self, owner_id: uuid.UUID | None, limit: int, offset: int
-    ) -> list[Job]: ...
+        self,
+        owner_id: uuid.UUID | None,
+        limit: int,
+        cursor: tuple[datetime, uuid.UUID] | None = None,
+    ) -> list[Job]:
+        """Returns up to limit + 1 jobs ordered by (created_at desc, id desc),
+        starting strictly after `cursor` (if given). The caller uses the
+        extra (limit + 1)-th row only to detect whether another page exists;
+        it must not be included in the page returned to the client."""
+        ...
 
     @abstractmethod
     async def transition_status(
