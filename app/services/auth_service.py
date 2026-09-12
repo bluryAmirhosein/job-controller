@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 from app.core.security import create_access_token, hash_password, verify_password
@@ -15,16 +16,30 @@ class AuthService:
         if existing_user is not None:
             raise ValueError("User with this email already exists")
 
+        # bcrypt hashing is CPU-bound and synchronous - running it directly
+        # inside this coroutine blocks the entire event loop for the
+        # duration of the hash (tens to hundreds of ms). Offload it to a
+        # worker thread so other requests keep being served concurrently.
+        hashed_password = await asyncio.to_thread(hash_password, data.password)
+
         user = User(
             email=data.email,
-            hashed_password=hash_password(data.password),
+            hashed_password=hashed_password,
             role=UserRole.USER,
         )
         return await self._user_repository.create(user)
 
     async def authenticate(self, email: str, password: str) -> str:
         user = await self._user_repository.get_by_email(email)
-        if user is None or not verify_password(password, user.hashed_password):
+        if user is None:
+            # Still do a dummy hash comparison so response time doesn't leak
+            # whether the email exists (timing side-channel), while keeping
+            # the CPU-bound work off the event loop.
+            await asyncio.to_thread(verify_password, password, hash_password(""))
+            raise ValueError("Invalid email or password")
+
+        password_ok = await asyncio.to_thread(verify_password, password, user.hashed_password)
+        if not password_ok:
             raise ValueError("Invalid email or password")
         if not user.is_active:
             raise ValueError("User account is disabled")
