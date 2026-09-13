@@ -37,7 +37,10 @@ class JobService:
         )
 
         async with self._job_repository.owner_lock(current_user.id):
-            job = await self._job_repository.create(job)
+            # commit=False: everything below stays in the same transaction
+            # that holds the advisory xact lock, so the concurrency check
+            # (count_by_statuses_for_owner) is actually protected by it.
+            job = await self._job_repository.create(job, commit=False)
 
             active_count = await self._job_repository.count_by_statuses_for_owner(
                 current_user.id, (JobStatus.PENDING, JobStatus.RUNNING)
@@ -49,11 +52,16 @@ class JobService:
                 try:
                     await publish_job_message(str(job.id))
                 except Exception as exc:
+                    # Commit explicitly here: we want the job row + FAILED
+                    # status to survive even though we're about to raise
+                    # (which would otherwise trigger a rollback inside
+                    # owner_lock and wipe the job out entirely).
                     await self._job_repository.transition_status(
                         job.id,
                         expected_statuses=(JobStatus.PENDING,),
                         new_status=JobStatus.FAILED,
                         error_message=f"Failed to publish job to queue: {exc}",
+                        commit=True,
                     )
                     raise RuntimeError("Failed to enqueue job") from exc
             else:
@@ -61,6 +69,7 @@ class JobService:
                     job.id,
                     expected_statuses=(JobStatus.PENDING,),
                     new_status=JobStatus.QUEUED,
+                    commit=False,
                 )
                 job.status = JobStatus.QUEUED
 

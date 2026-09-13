@@ -19,9 +19,14 @@ class SQLAlchemyJobRepository(IJobRepository):
         self._session = session
         self._redis = redis
 
-    async def create(self, job: Job) -> Job:
+    async def create(self, job: Job, *, commit: bool = True) -> Job:
         self._session.add(job)
-        await self._session.commit()
+        if commit:
+            await self._session.commit()
+        else:
+            # Just flush so job.id/created_at are populated without ending
+            # the transaction (needed while we're still inside owner_lock).
+            await self._session.flush()
         await self._session.refresh(job)
 
         await bump_job_list_version(self._redis, str(job.created_by_id))
@@ -92,6 +97,7 @@ class SQLAlchemyJobRepository(IJobRepository):
         result: dict | None = None,
         error_message: str | None = None,
         retry_count: int | None = None,
+        commit: bool = True,
     ) -> bool:
         values: dict = {"status": new_status}
         if result is not None:
@@ -110,7 +116,11 @@ class SQLAlchemyJobRepository(IJobRepository):
         )
         exec_result = await self._session.execute(stmt)
         owner_row = exec_result.first()
-        await self._session.commit()
+
+        if commit:
+            await self._session.commit()
+        else:
+            await self._session.flush()
 
         if owner_row is None:
             return False
@@ -173,10 +183,27 @@ class SQLAlchemyJobRepository(IJobRepository):
 
     @contextlib.asynccontextmanager
     async def _owner_lock(self, owner_id: uuid.UUID):
-        key_result = await self._session.execute(select(func.hashtext(str(owner_id))))
-        lock_key = key_result.scalar_one()
-        await self._session.execute(select(func.pg_advisory_lock(lock_key)))
+        # pg_advisory_xact_lock is transaction-scoped: Postgres releases it
+        # automatically on COMMIT or ROLLBACK of this session's transaction,
+        # no matter what happens to the underlying pooled connection
+        # afterwards. This removes the manual lock/unlock pair we used to
+        # have with pg_advisory_lock (session-scoped), which under async
+        # connection pooling + commits happening mid-block could leave a
+        # lock held longer than intended and lead to circular waits
+        # (the deadlock you're seeing) between concurrent requests.
+        lock_key_result = await self._session.execute(
+            select(func.hashtext(str(owner_id)))
+        )
+        lock_key = lock_key_result.scalar_one()
+        await self._session.execute(select(func.pg_advisory_xact_lock(lock_key)))
+
         try:
             yield
-        finally:
-            await self._session.execute(select(func.pg_advisory_unlock(lock_key)))
+        except Exception:
+            # Ends the transaction -> releases the advisory lock too.
+            await self._session.rollback()
+            raise
+        else:
+            # If the caller already committed (e.g. after handling a
+            # publish failure), this is a harmless no-op.
+            await self._session.commit()
